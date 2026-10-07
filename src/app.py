@@ -5,11 +5,14 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 import os
 from pathlib import Path
+import secrets
+import time
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +21,82 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+SESSION_COOKIE = "teacher_session"
+SESSION_TTL_SECONDS = 8 * 60 * 60
+teacher_sessions: dict[str, tuple[str, float]] = {}
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def require_teacher(teacher_session: str | None = Cookie(default=None)) -> str:
+    """Require a valid teacher session for activity changes."""
+    session = teacher_sessions.get(teacher_session or "")
+    if session is None or session[1] <= time.time():
+        if teacher_session:
+            teacher_sessions.pop(teacher_session, None)
+        raise HTTPException(status_code=401, detail="Teacher login required")
+    return session[0]
+
+
+@app.post("/auth/login")
+def login(credentials: LoginRequest, response: Response):
+    """Create a teacher session using credentials configured by the operator."""
+    teacher_username = os.environ.get("TEACHER_USERNAME")
+    teacher_password = os.environ.get("TEACHER_PASSWORD")
+    if not teacher_username or not teacher_password:
+        raise HTTPException(
+            status_code=503,
+            detail="Teacher login is not configured on this server",
+        )
+
+    valid_username = secrets.compare_digest(
+        credentials.username, teacher_username
+    )
+    valid_password = secrets.compare_digest(
+        credentials.password, teacher_password
+    )
+    if not (valid_username and valid_password):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    session_token = secrets.token_urlsafe(32)
+    teacher_sessions[session_token] = (
+        teacher_username,
+        time.time() + SESSION_TTL_SECONDS,
+    )
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=session_token,
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=os.environ.get("COOKIE_SECURE", "").lower() == "true",
+        samesite="strict",
+        path="/",
+    )
+    return {"username": teacher_username}
+
+
+@app.get("/auth/session")
+def get_session(teacher: str | None = Depends(require_teacher)):
+    return {"authenticated": True, "username": teacher}
+
+
+@app.post("/auth/logout")
+def logout(response: Response, teacher_session: str | None = Cookie(default=None)):
+    if teacher_session:
+        teacher_sessions.pop(teacher_session, None)
+    response.delete_cookie(
+        key=SESSION_COOKIE,
+        httponly=True,
+        secure=os.environ.get("COOKIE_SECURE", "").lower() == "true",
+        samesite="strict",
+        path="/",
+    )
+    return {"message": "Logged out"}
+
 
 # In-memory activity database
 activities = {
@@ -89,7 +168,9 @@ def get_activities():
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str, email: str, teacher: str = Depends(require_teacher)
+):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +192,9 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str, email: str, teacher: str = Depends(require_teacher)
+):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
